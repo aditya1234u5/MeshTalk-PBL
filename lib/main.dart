@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'screens/setup_screen.dart';
+import 'theme/app_theme.dart';
 
 void main() {
   // Hive's own init happens inside PersistenceService.init() (called from
@@ -18,10 +19,7 @@ class BitMeshApp extends StatelessWidget {
     return MaterialApp(
       title: 'bitmesh',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        colorSchemeSeed: Colors.blue,
-        useMaterial3: true,
-      ),
+      theme: buildAppTheme(),
       home: const SetupScreen(),
     );
   }

@@ -1,13 +1,13 @@
-import 'dart:math';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
-import '../models/peer.dart';
 
-/// Draws the self device at the center with a line out to each directly
-/// connected (1-hop) neighbor. This is deliberately NOT a full mesh graph -
-/// flood relay carries no path information, so we only draw what we
-/// actually know: our own direct connections. Labeling it "live mesh
-/// topology" while only showing 1-hop neighbors would be misleading, so
-/// the widget's title is explicit about that scope.
+import '../models/peer.dart';
+import '../theme/app_theme.dart';
+
+/// Draws you at the center and each direct (1-hop) neighbor arranged
+/// radially around you, connected by a line. This only ever shows direct
+/// neighbors - see the README's "Known limitations" on why the full
+/// multi-hop mesh can't be honestly drawn with flood-relay routing.
 class MeshTopologyView extends StatelessWidget {
   final List<Peer> directNeighbors;
 
@@ -16,23 +16,87 @@ class MeshTopologyView extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
-          child: Text(
-            'Direct connections (1 hop)',
-            style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+        Expanded(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: LayoutBuilder(
+              builder: (context, constraints) => CustomPaint(
+                size: Size(constraints.maxWidth, constraints.maxHeight),
+                painter: _TopologyPainter(neighborCount: directNeighbors.length),
+                child: _NodeLabels(neighbors: directNeighbors),
+              ),
+            ),
           ),
         ),
-        AspectRatio(
-          aspectRatio: 1.3,
-          child: CustomPaint(
-            painter: _TopologyPainter(neighborCount: directNeighbors.length),
-            child: _NeighborLabels(neighbors: directNeighbors),
+        if (directNeighbors.isEmpty)
+          const Padding(
+            padding: EdgeInsets.only(bottom: 32),
+            child: Text(
+              'No direct links yet - this view only shows\npeers you are connected to over BLE right now.',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: AppColors.textMuted, fontSize: 13, height: 1.4),
+            ),
           ),
-        ),
       ],
+    );
+  }
+}
+
+class _NodeLabels extends StatelessWidget {
+  final List<Peer> neighbors;
+  const _NodeLabels({required this.neighbors});
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final center = Offset(constraints.maxWidth / 2, constraints.maxHeight / 2);
+        final radius = math.min(constraints.maxWidth, constraints.maxHeight) / 2 - 48;
+
+        return Stack(
+          children: [
+            // Self node label
+            Positioned(
+              left: center.dx - 28,
+              top: center.dy + 14,
+              child: const _NodeChip(label: 'you', color: AppColors.signal),
+            ),
+            for (var i = 0; i < neighbors.length; i++)
+              () {
+                final angle = (2 * math.pi * i / neighbors.length) - (math.pi / 2);
+                final pos = center + Offset(math.cos(angle), math.sin(angle)) * radius;
+                return Positioned(
+                  left: pos.dx - 36,
+                  top: pos.dy + 14,
+                  child: _NodeChip(label: neighbors[i].displayName, color: AppColors.link),
+                );
+              }(),
+          ],
+        );
+      },
+    );
+  }
+}
+
+class _NodeChip extends StatelessWidget {
+  final String label;
+  final Color color;
+  const _NodeChip({required this.label, required this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: color.withValues(alpha: 0.5)),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(color: color, fontFamily: 'monospace', fontSize: 11),
+      ),
     );
   }
 }
@@ -43,116 +107,46 @@ class _TopologyPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    final center = Offset(size.width / 2, size.height / 2);
-    final radius = min(size.width, size.height) / 2 - 40;
-    final linePaint = Paint()
-      ..color = Colors.blue.shade200
-      ..strokeWidth = 2;
+    final center = size.center(Offset.zero);
+    final radius = math.min(size.width, size.height) / 2 - 48;
 
-    if (neighborCount == 0) return;
+    // Faint range ring, purely contextual.
+    canvas.drawCircle(
+      center,
+      radius,
+      Paint()
+        ..color = AppColors.hairline
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1,
+    );
 
     for (var i = 0; i < neighborCount; i++) {
-      final angle = (2 * pi * i / neighborCount) - pi / 2;
-      final point = Offset(
-        center.dx + radius * cos(angle),
-        center.dy + radius * sin(angle),
+      final angle = (2 * math.pi * i / neighborCount) - (math.pi / 2);
+      final pos = center + Offset(math.cos(angle), math.sin(angle)) * radius;
+
+      canvas.drawLine(
+        center,
+        pos,
+        Paint()
+          ..color = AppColors.link.withValues(alpha: 0.5)
+          ..strokeWidth = 1.5,
       );
-      canvas.drawLine(center, point, linePaint);
+      canvas.drawCircle(pos, 6, Paint()..color = AppColors.link);
     }
+
+    // Self node.
+    canvas.drawCircle(center, 9, Paint()..color = AppColors.signal);
+    canvas.drawCircle(
+      center,
+      9,
+      Paint()
+        ..color = AppColors.signal.withValues(alpha: 0.35)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 5,
+    );
   }
 
   @override
   bool shouldRepaint(covariant _TopologyPainter oldDelegate) =>
       oldDelegate.neighborCount != neighborCount;
-}
-
-class _NeighborLabels extends StatelessWidget {
-  final List<Peer> neighbors;
-  const _NeighborLabels({required this.neighbors});
-
-  @override
-  Widget build(BuildContext context) {
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final size = constraints.biggest;
-        final center = Offset(size.width / 2, size.height / 2);
-        final radius = min(size.width, size.height) / 2 - 40;
-
-        return Stack(
-          children: [
-            // Self node, always centered.
-            Positioned(
-              left: center.dx - 24,
-              top: center.dy - 24,
-              child: const _NodeBubble(label: 'You', highlight: true),
-            ),
-            // One bubble per direct neighbor, evenly spaced in a circle.
-            for (var i = 0; i < neighbors.length; i++)
-              Builder(builder: (context) {
-                final angle = (2 * pi * i / neighbors.length) - pi / 2;
-                final point = Offset(
-                  center.dx + radius * cos(angle),
-                  center.dy + radius * sin(angle),
-                );
-                return Positioned(
-                  left: point.dx - 24,
-                  top: point.dy - 24,
-                  child: _NodeBubble(
-                    label: neighbors[i].displayName.isNotEmpty
-                        ? neighbors[i].displayName
-                        : neighbors[i].peerId.substring(0, 6),
-                  ),
-                );
-              }),
-            if (neighbors.isEmpty)
-              Positioned(
-                left: 0,
-                right: 0,
-                top: center.dy + 40,
-                child: const Center(
-                  child: Text(
-                    'No direct peers yet',
-                    style: TextStyle(color: Colors.grey, fontSize: 12),
-                  ),
-                ),
-              ),
-          ],
-        );
-      },
-    );
-  }
-}
-
-class _NodeBubble extends StatelessWidget {
-  final String label;
-  final bool highlight;
-  const _NodeBubble({required this.label, this.highlight = false});
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Container(
-          width: 40,
-          height: 40,
-          decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            color: highlight ? Colors.blue.shade600 : Colors.green.shade600,
-          ),
-          child: Icon(
-            highlight ? Icons.person : Icons.bluetooth_connected,
-            color: Colors.white,
-            size: 20,
-          ),
-        ),
-        const SizedBox(height: 2),
-        Text(
-          label,
-          style: const TextStyle(fontSize: 10),
-          overflow: TextOverflow.ellipsis,
-        ),
-      ],
-    );
-  }
 }
