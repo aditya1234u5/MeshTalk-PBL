@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:flutter_ble_peripheral/flutter_ble_peripheral.dart';
@@ -78,6 +77,7 @@ class BleMeshService extends ChangeNotifier {
   }
 
   Future<void> stop() async {
+    _peripheralDataSub?.cancel();
     _isRunning = false;
     await _scanSub?.cancel();
     await FlutterBluePlus.stopScan();
@@ -93,16 +93,21 @@ class BleMeshService extends ChangeNotifier {
   // Peripheral role: advertise + accept incoming writes
   // ---------------------------------------------------------------------
 
+  final _peripheral = FlutterBlePeripheral();
+  StreamSubscription<Uint8List>? _peripheralDataSub;
+
   Future<void> _startPeripheral() async {
-    final peripheral = FlutterBlePeripheral();
-    final advertiseData = AdvertiseData(
+    final advertiseData = AdvertiseDataCore(
       serviceUuid: MeshUuids.serviceUuid,
       localName: 'bm_${selfPeerId.substring(0, 8)}',
     );
-    // NOTE: wire whatever "on write request" callback your installed
-    // flutter_ble_peripheral version exposes to onPeripheralDataReceived()
-    // below - see README "Peripheral GATT server wiring".
-    await peripheral.start(advertiseData: advertiseData);
+    await _peripheral.start(
+      advertiseData: advertiseData,
+      gattServer: const GattServerSettings(),
+    );
+    _peripheralDataSub = _peripheral.onDataReceived.listen((bytes) {
+      onPeripheralDataReceived('unknown', bytes);
+    });
   }
 
   /// Called by the peripheral GATT server callback when a central peer

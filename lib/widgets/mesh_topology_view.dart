@@ -84,7 +84,7 @@ class _NeighborLabels extends StatelessWidget {
             Positioned(
               left: center.dx - 24,
               top: center.dy - 24,
-              child: _NodeBubble(label: 'You', highlight: true),
+              child: const _NodeBubble(label: 'You', highlight: true),
             ),
             // One bubble per direct neighbor, evenly spaced in a circle.
             for (var i = 0; i < neighbors.length; i++)
