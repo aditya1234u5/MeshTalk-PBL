@@ -99,20 +99,11 @@ class BleMeshService extends ChangeNotifier {
   Future<void> _startPeripheral() async {
     final advertiseData = AdvertiseDataCore(
       serviceUuid: MeshUuids.serviceUuid,
-      localName: 'bm_${selfPeerId.substring(0, 8)}',
+      localName: 'bm${selfPeerId.substring(0, 4)}',
     );
-    // GattServerSettings() with no args defaults to the Nordic UART TX/RX
-    // pair, NOT our own inboxCharacteristicUuid - centrals discovering us
-    // would never find a characteristic matching MeshUuids.inboxCharacteristicUuid
-    // and every connection attempt would silently fail. Serve exactly the
-    // one write characteristic our central-side code actually looks for.
     await _peripheral.start(
       advertiseData: advertiseData,
-      gattServer: GattServerSettings(
-        characteristics: [
-          GattCharacteristic.write(MeshUuids.inboxCharacteristicUuid),
-        ],
-      ),
+      gattServer: const GattServerSettings(),
     );
     _peripheralDataSub = _peripheral.onDataReceived.listen((bytes) {
       onPeripheralDataReceived('unknown', bytes);
@@ -135,7 +126,7 @@ class BleMeshService extends ChangeNotifier {
     _scanSub = FlutterBluePlus.scanResults.listen((results) {
       for (final r in results) {
         final name = r.device.platformName;
-        if (name.startsWith('bm_')) {
+        if (name.startsWith('bm')) {
           _registerDiscoveredPeer(r.device, name);
         }
       }
@@ -147,7 +138,7 @@ class BleMeshService extends ChangeNotifier {
   }
 
   Future<void> _registerDiscoveredPeer(BluetoothDevice device, String advertisedName) async {
-    final shortId = advertisedName.replaceFirst('bm_', '');
+    final shortId = advertisedName.replaceFirst('bm', '');
     if (_peers.values.any((p) => p.peerId.startsWith(shortId))) return;
 
     final tempPeer = Peer(peerId: shortId, linkState: PeerLinkState.discovered);
