@@ -97,15 +97,37 @@ class BleMeshService extends ChangeNotifier {
   StreamSubscription<Uint8List>? _peripheralDataSub;
 
   Future<void> _startPeripheral() async {
+    // Deliberately no localName: identity now comes from device.remoteId
+    // at scan time (see _startCentralScan), not from the advertised name,
+    // which proved unreliable to read back on real hardware even when
+    // confirmed present on the advertising side. This also matches real
+    // bitchat's approach (setIncludeDeviceName(false)) - service UUID
+    // alone in the primary advertisement, nothing else needed.
     final advertiseData = AdvertiseDataCore(
       serviceUuid: MeshUuids.serviceUuid,
-      localName: 'bm${selfPeerId.substring(0, 4)}',
     );
-    await _peripheral.start(
-      advertiseData: advertiseData,
-      gattServer: const GattServerSettings(),
-    );
+    debugPrint('[bitmesh] starting peripheral, service=${MeshUuids.serviceUuid}');
+    // GattServerSettings() with no args defaults to the Nordic UART TX/RX
+    // pair, NOT our own inboxCharacteristicUuid - centrals discovering us
+    // would never find a characteristic matching MeshUuids.inboxCharacteristicUuid
+    // and every connection attempt would silently fail. Serve exactly the
+    // one write characteristic our central-side code actually looks for.
+    try {
+      await _peripheral.start(
+        advertiseData: advertiseData,
+        gattServer: GattServerSettings(
+          characteristics: [
+            GattCharacteristic.write(MeshUuids.inboxCharacteristicUuid),
+          ],
+        ),
+      );
+      debugPrint('[bitmesh] peripheral.start() completed without throwing');
+    } catch (e, st) {
+      debugPrint('[bitmesh] peripheral.start() THREW: $e');
+      debugPrint('$st');
+    }
     _peripheralDataSub = _peripheral.onDataReceived.listen((bytes) {
+      debugPrint('[bitmesh] onDataReceived: ${bytes.length} bytes');
       onPeripheralDataReceived('unknown', bytes);
     });
   }
@@ -125,21 +147,28 @@ class BleMeshService extends ChangeNotifier {
   Future<void> _startCentralScan() async {
     _scanSub = FlutterBluePlus.scanResults.listen((results) {
       for (final r in results) {
-        final name = r.device.platformName;
-        if (name.startsWith('bm')) {
-          _registerDiscoveredPeer(r.device, name);
-        }
+        // The advertised local name isn't reliably coming through on
+        // real devices (both platformName and advertisementData.advName
+        // came back empty in testing, even with advertising confirmed
+        // working on the peripheral side). Rather than depend on a name
+        // at all, use the device's own remoteId as a stable per-session
+        // identity - scan results here are already filtered server-side
+        // to only our mesh service UUID (withServices below), so no name
+        // check is needed to know this is a genuine mesh peer.
+        final tempId = r.device.remoteId.toString();
+        debugPrint('[bitmesh] scan result: id=$tempId rssi=${r.rssi}');
+        _registerDiscoveredPeer(r.device, tempId);
       }
     });
+    debugPrint('[bitmesh] starting central scan, filtering service=${MeshUuids.serviceUuid}');
     await FlutterBluePlus.startScan(
       withServices: [Guid(MeshUuids.serviceUuid)],
       continuousUpdates: true,
     );
   }
 
-  Future<void> _registerDiscoveredPeer(BluetoothDevice device, String advertisedName) async {
-    final shortId = advertisedName.replaceFirst('bm', '');
-    if (_peers.values.any((p) => p.peerId.startsWith(shortId))) return;
+  Future<void> _registerDiscoveredPeer(BluetoothDevice device, String shortId) async {
+    if (_peers.containsKey(shortId)) return;
 
     final tempPeer = Peer(peerId: shortId, linkState: PeerLinkState.discovered);
     _peers[shortId] = tempPeer;
@@ -177,7 +206,9 @@ class BleMeshService extends ChangeNotifier {
           notifyListeners();
         }
       });
-    } catch (e) {
+    } catch (e, st) {
+      debugPrint('[bitmesh] connect/discover FAILED for $shortId: $e');
+      debugPrint('$st');
       tempPeer.linkState = PeerLinkState.disconnected;
       notifyListeners();
     }
