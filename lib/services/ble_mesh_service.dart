@@ -101,9 +101,18 @@ class BleMeshService extends ChangeNotifier {
       serviceUuid: MeshUuids.serviceUuid,
       localName: 'bm_${selfPeerId.substring(0, 8)}',
     );
+    // GattServerSettings() with no args defaults to the Nordic UART TX/RX
+    // pair, NOT our own inboxCharacteristicUuid - centrals discovering us
+    // would never find a characteristic matching MeshUuids.inboxCharacteristicUuid
+    // and every connection attempt would silently fail. Serve exactly the
+    // one write characteristic our central-side code actually looks for.
     await _peripheral.start(
       advertiseData: advertiseData,
-      gattServer: const GattServerSettings(),
+      gattServer: GattServerSettings(
+        characteristics: [
+          GattCharacteristic.write(MeshUuids.inboxCharacteristicUuid),
+        ],
+      ),
     );
     _peripheralDataSub = _peripheral.onDataReceived.listen((bytes) {
       onPeripheralDataReceived('unknown', bytes);
