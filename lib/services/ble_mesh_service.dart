@@ -1,32 +1,41 @@
 import 'dart:async';
+import 'dart:typed_data';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
-import 'native_gatt_bridge.dart';
 import 'package:uuid/uuid.dart';
 
 import '../models/message.dart';
 import '../models/mesh_packet.dart';
 import '../models/peer.dart';
+import '../protocol/packet.dart';
+import '../protocol/packet_codec.dart';
+import '../protocol/packet_type.dart';
+import '../protocol/protocol_constants.dart';
+import 'ble_fragment.dart';
+import 'ble_reassembler.dart';
 import 'encryption_service.dart';
+import 'native_gatt_bridge.dart';
 import 'persistence_service.dart';
 
 /// Custom GATT identifiers for the mesh chat service.
-/// Every device runs BOTH roles at once:
-///  - PERIPHERAL: advertises this service, accepts writes from central peers
-///  - CENTRAL: scans for the service, connects, writes packets to peers
 class MeshUuids {
-  static const String serviceUuid = '7a4f2c10-9b3d-4e8a-8c1a-1a2b3c4d5e6f';
-  static const String inboxCharacteristicUuid = '7a4f2c11-9b3d-4e8a-8c1a-1a2b3c4d5e6f';
+  static const String serviceUuid =
+      '7a4f2c10-9b3d-4e8a-8c1a-1a2b3c4d5e6f';
+  static const String inboxCharacteristicUuid =
+      '7a4f2c11-9b3d-4e8a-8c1a-1a2b3c4d5e6f';
 }
 
-/// Ties together the central role, peripheral role, per-peer encrypted
-/// sessions, mesh relay logic (TTL decrement + seen-message dedup), and
-/// local persistence into one service the UI layer consumes via
-/// ChangeNotifier.
+/// BLE mesh service.
 ///
-/// PLATFORM NOTE: simultaneous central+peripheral operation is supported on
-/// Android without much fuss. On iOS, background peripheral/advertising has
-/// real restrictions - budget time to test this specifically on iOS.
+/// Phase 2B connects the application protocol to the reliable Phase 1 BLE
+/// transport:
+///
+///   MeshProtocolPacket -> MeshPacketCodec -> BLE fragments -> GATT
+///   GATT -> BLE reassembly -> MeshPacketCodec -> MeshProtocolPacket
+///
+/// The existing hop-by-hop encryption service remains in place. The protocol
+/// layer now owns packet type, TTL, timestamp, flags, IDs and binary framing.
 class BleMeshService extends ChangeNotifier {
   final EncryptionService encryption;
   final PersistenceService persistence;
@@ -39,14 +48,24 @@ class BleMeshService extends ChangeNotifier {
     required this.selfDisplayName,
   }) : selfPeerId = const Uuid().v4();
 
-  final Map<String, Peer> _peers = {}; // peerId -> Peer (discovered/connected)
-  final Map<String, BluetoothDevice> _connectedDevices = {}; // peerId -> live BLE device
+  final Map<String, Peer> _peers = {};
+  final Map<String, BluetoothDevice> _connectedDevices = {};
   final Map<String, BluetoothCharacteristic> _outboxCharacteristics = {};
+  final Map<String, int> _peerMtu = {};
+
+  final Map<String, Future<void>> _writeQueues = {};
+  final Set<String> _connectingPeers = {};
+
   final List<ChatMessage> _messages = [];
-  final Set<String> _seenMessageIds = {}; // relay dedup cache, bounded below
+  final Set<String> _seenMessageIds = {};
   final List<String> _seenMessageOrder = [];
+
+  final Map<String, DateTime> _lastReconnectAttempt = {};
+
+  final BleReassembler _reassembler = BleReassembler();
+
   static const int _maxSeenCache = 500;
-  static const int defaultTtl = 6; // max relay hops
+  static const int defaultTtl = ProtocolConstants.defaultTtl;
 
   StreamSubscription<List<ScanResult>>? _scanSub;
   bool _isRunning = false;
@@ -55,129 +74,191 @@ class BleMeshService extends ChangeNotifier {
   List<ChatMessage> get messages => List.unmodifiable(_messages);
   bool get isRunning => _isRunning;
 
-  /// Direct (1-hop) neighbors only - this is what the topology view draws
-  /// as "spokes" out of the self node. Multi-hop peers are only known
-  /// indirectly (their messages arrive via a neighbor) so we don't claim
-  /// to know the full mesh graph beyond one hop, which would be dishonest
-  /// given flood-relay carries no routing/path information.
-  List<Peer> get directNeighbors =>
-      _peers.values.where((p) => p.linkState == PeerLinkState.connected).toList();
+  List<Peer> get directNeighbors => _peers.values
+      .where((p) => p.linkState == PeerLinkState.connected)
+      .toList();
 
-  // ---------------------------------------------------------------------
+  // -------------------------------------------------------------------------
   // Lifecycle
-  // ---------------------------------------------------------------------
+  // -------------------------------------------------------------------------
 
   Future<void> start() async {
     if (_isRunning) return;
+
     _isRunning = true;
     _messages.addAll(persistence.loadAll());
+
     await _startPeripheral();
     await _startCentralScan();
+
     notifyListeners();
   }
 
   Future<void> stop() async {
-    _peripheralDataSub?.cancel();
     _isRunning = false;
+
+    await _peripheralDataSub?.cancel();
+    _peripheralDataSub = null;
+
     await _scanSub?.cancel();
+    _scanSub = null;
+
     await FlutterBluePlus.stopScan();
     await _nativeGatt.stop();
-    for (final device in _connectedDevices.values) {
-      await device.disconnect();
+
+    final devices = List<BluetoothDevice>.from(_connectedDevices.values);
+
+    for (final device in devices) {
+      try {
+        await device.disconnect();
+      } catch (_) {}
     }
+
     _connectedDevices.clear();
+    _outboxCharacteristics.clear();
+    _peerMtu.clear();
+    _writeQueues.clear();
+    _connectingPeers.clear();
+    _reassembler.clear();
+
     notifyListeners();
   }
 
-  // ---------------------------------------------------------------------
-  // Peripheral role: advertise + accept incoming writes
-  // ---------------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // Peripheral
+  // -------------------------------------------------------------------------
 
   final _nativeGatt = NativeGattBridge();
   StreamSubscription<GattWrite>? _peripheralDataSub;
 
   Future<void> _startPeripheral() async {
-    // Peripheral role now runs on a small custom native Android bridge
-    // (android/app/.../MainActivity.kt) instead of flutter_ble_peripheral.
-    // That plugin's onDataReceived only ever gave raw bytes with no way
-    // to tell which connected central just wrote - confirmed as the
-    // actual cause of messages being attributed to the wrong peer during
-    // 2-phone testing (a "most recently connected" heuristic was tried
-    // first and wasn't reliable once 2+ peers were connected at once).
-    // Android's own GATT callback gives the writing device directly, so
-    // the native bridge captures and forwards that real identity.
-    debugPrint('[bitmesh] starting native peripheral, service=${MeshUuids.serviceUuid}');
+    debugPrint(
+      '[bitmesh] starting native peripheral, '
+      'service=${MeshUuids.serviceUuid}',
+    );
+
     try {
       await _nativeGatt.start();
       debugPrint('[bitmesh] native peripheral started');
     } catch (e, st) {
-      debugPrint('[bitmesh] native peripheral start THREW: $e');
+      debugPrint('[bitmesh] native peripheral start failed: $e');
       debugPrint('$st');
     }
+
+    await _peripheralDataSub?.cancel();
+
     _peripheralDataSub = _nativeGatt.onWrite.listen((write) {
-      debugPrint('[bitmesh] write from ${write.address}: ${write.bytes.length} bytes');
+      debugPrint(
+        '[bitmesh] write from ${write.address}: '
+        '${write.bytes.length} bytes',
+      );
+
       onPeripheralDataReceived(write.address, write.bytes);
     });
   }
 
-  /// Called with the REAL identity of whoever wrote these bytes to us,
-  /// straight from the native GATT callback - no more guessing.
-  void onPeripheralDataReceived(String fromPeerId, Uint8List bytes) {
+  void onPeripheralDataReceived(
+    String fromPeerId,
+    Uint8List bytes,
+  ) {
     _handleIncomingBytes(fromPeerId, bytes);
   }
 
-  // ---------------------------------------------------------------------
-  // Central role: scan + connect + handshake + write
-  // ---------------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // Central
+  // -------------------------------------------------------------------------
 
   Future<void> _startCentralScan() async {
+    await _scanSub?.cancel();
+
     _scanSub = FlutterBluePlus.scanResults.listen((results) {
-      for (final r in results) {
-        // The advertised local name isn't reliably coming through on
-        // real devices (both platformName and advertisementData.advName
-        // came back empty in testing, even with advertising confirmed
-        // working on the peripheral side). Rather than depend on a name
-        // at all, use the device's own remoteId as a stable per-session
-        // identity - scan results here are already filtered server-side
-        // to only our mesh service UUID (withServices below), so no name
-        // check is needed to know this is a genuine mesh peer.
-        final tempId = r.device.remoteId.toString();
-        debugPrint('[bitmesh] scan result: id=$tempId rssi=${r.rssi}');
-        _registerDiscoveredPeer(r.device, tempId);
+      for (final result in results) {
+        final peerId = result.device.remoteId.toString();
+
+        debugPrint(
+          '[bitmesh] scan result: '
+          'id=$peerId rssi=${result.rssi}',
+        );
+
+        _registerDiscoveredPeer(result.device, peerId);
       }
     });
-    debugPrint('[bitmesh] starting central scan, filtering service=${MeshUuids.serviceUuid}');
+
+    debugPrint(
+      '[bitmesh] starting central scan, '
+      'filtering service=${MeshUuids.serviceUuid}',
+    );
+
     await FlutterBluePlus.startScan(
       withServices: [Guid(MeshUuids.serviceUuid)],
       continuousUpdates: true,
     );
   }
 
-  Future<void> _registerDiscoveredPeer(BluetoothDevice device, String shortId) async {
-    if (_peers.containsKey(shortId)) return;
+  Future<void> _registerDiscoveredPeer(
+    BluetoothDevice device,
+    String shortId,
+  ) async {
+    if (!_isRunning) return;
 
-    final tempPeer = Peer(peerId: shortId, linkState: PeerLinkState.discovered);
+    if (_connectingPeers.contains(shortId)) return;
+
+    final existing = _peers[shortId];
+
+    if (existing != null &&
+        existing.linkState == PeerLinkState.connected) {
+      return;
+    }
+
+    _connectingPeers.add(shortId);
+
+    final tempPeer = existing ??
+        Peer(
+          peerId: shortId,
+          linkState: PeerLinkState.discovered,
+        );
+
     _peers[shortId] = tempPeer;
     notifyListeners();
 
     try {
       tempPeer.linkState = PeerLinkState.connecting;
       notifyListeners();
-      await device.connect(timeout: const Duration(seconds: 10));
+
+      if (device.isConnected != true) {
+        await device.connect(timeout: const Duration(seconds: 10));
+      }
+
+      var mtu = 23;
+
+      try {
+        mtu = await device.requestMtu(247);
+        debugPrint('[bitmesh] negotiated MTU with $shortId: $mtu');
+      } catch (e) {
+        debugPrint(
+          '[bitmesh] MTU negotiation unavailable/failed '
+          'for $shortId: $e',
+        );
+      }
+
+      _peerMtu[shortId] = mtu.clamp(23, 517);
+
       final services = await device.discoverServices();
       final meshService = services.firstWhere(
-        (s) => s.uuid.toString().toLowerCase() == MeshUuids.serviceUuid,
+        (service) =>
+            service.uuid.toString().toLowerCase() ==
+            MeshUuids.serviceUuid,
       );
+
       final inbox = meshService.characteristics.firstWhere(
-        (c) => c.uuid.toString().toLowerCase() == MeshUuids.inboxCharacteristicUuid,
+        (characteristic) =>
+            characteristic.uuid.toString().toLowerCase() ==
+            MeshUuids.inboxCharacteristicUuid,
       );
 
       _connectedDevices[shortId] = device;
       _outboxCharacteristics[shortId] = inbox;
 
-      // Perform the X25519 handshake before this peer is usable for chat.
-      // Handshake packets travel with ttl=1 (never relayed further) and
-      // an unencrypted payload (there's no session key yet to encrypt with).
       await _sendHandshake(shortId);
 
       tempPeer.linkState = PeerLinkState.connected;
@@ -185,156 +266,377 @@ class BleMeshService extends ChangeNotifier {
 
       device.connectionState.listen((state) {
         if (state == BluetoothConnectionState.disconnected) {
-          tempPeer.linkState = PeerLinkState.disconnected;
-          _connectedDevices.remove(shortId);
-          _outboxCharacteristics.remove(shortId);
-          encryption.dropSession(shortId);
-          notifyListeners();
+          _handleDisconnect(shortId, device, tempPeer);
         }
       });
     } catch (e, st) {
       debugPrint('[bitmesh] connect/discover FAILED for $shortId: $e');
       debugPrint('$st');
+
       tempPeer.linkState = PeerLinkState.disconnected;
       notifyListeners();
+    } finally {
+      _connectingPeers.remove(shortId);
     }
   }
+
+  void _handleDisconnect(
+    String peerId,
+    BluetoothDevice device,
+    Peer peer,
+  ) {
+    _connectedDevices.remove(peerId);
+    _outboxCharacteristics.remove(peerId);
+    _peerMtu.remove(peerId);
+    _writeQueues.remove(peerId);
+    _reassembler.clear();
+
+    encryption.dropSession(peerId);
+
+    peer.linkState = PeerLinkState.disconnected;
+    notifyListeners();
+
+    if (!_isRunning) return;
+
+    final now = DateTime.now();
+    final last = _lastReconnectAttempt[peerId];
+
+    if (last != null &&
+        now.difference(last) < const Duration(seconds: 3)) {
+      return;
+    }
+
+    _lastReconnectAttempt[peerId] = now;
+
+    Future<void>.delayed(const Duration(seconds: 2), () async {
+      if (!_isRunning) return;
+
+      final current = _peers[peerId];
+      if (current?.linkState != PeerLinkState.disconnected) return;
+
+      debugPrint('[bitmesh] attempting reconnect to $peerId');
+      await _registerDiscoveredPeer(device, peerId);
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Phase 2 protocol helpers
+  // -------------------------------------------------------------------------
 
   Future<void> _sendHandshake(String peerId) async {
     final ourPublicKey = await encryption.ourPublicKeyBytes();
-    final packet = MeshPacket(
-      type: MeshPacket.typeHandshake,
+
+    final packet = MeshProtocolPacket(
+      type: MeshPacketType.noiseHandshake,
       ttl: 1,
-      msgId: const Uuid().v4(),
+      timestampMs: DateTime.now().millisecondsSinceEpoch,
+      messageId: const Uuid().v4(),
       senderId: selfPeerId,
       payload: ourPublicKey,
+      flags: 0,
     );
-    await _writeRaw(peerId, packet.toBytes());
+
+    await _writeRaw(peerId, MeshPacketCodec.encode(packet));
   }
 
-  Future<void> _writeRaw(String peerId, Uint8List bytes) async {
-    final char = _outboxCharacteristics[peerId];
-    if (char == null) return;
-    const chunkSize = 180; // conservative pre-MTU-negotiation chunk size
-    for (var i = 0; i < bytes.length; i += chunkSize) {
-      final end = (i + chunkSize < bytes.length) ? i + chunkSize : bytes.length;
-      await char.write(bytes.sublist(i, end), withoutResponse: false);
+  MeshProtocolPacket _buildEncryptedPacket({
+    required MeshPacketType type,
+    required int ttl,
+    required int timestampMs,
+    required String msgId,
+    required String senderId,
+    required Uint8List cipherText,
+  }) {
+    return MeshProtocolPacket(
+      type: type,
+      ttl: ttl,
+      timestampMs: timestampMs,
+      messageId: msgId,
+      senderId: senderId,
+      payload: cipherText,
+      flags: ProtocolConstants.flagEncrypted |
+          ProtocolConstants.flagRelayAllowed,
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Reliable BLE writes
+  // -------------------------------------------------------------------------
+
+  Future<void> _writeRaw(String peerId, Uint8List bytes) {
+    final previous = _writeQueues[peerId] ?? Future<void>.value();
+
+    final next = previous
+        .catchError((_) {})
+        .then<void>((_) => _performWrite(peerId, bytes));
+
+    _writeQueues[peerId] = next;
+    return next;
+  }
+
+  Future<void> _performWrite(
+    String peerId,
+    Uint8List bytes,
+  ) async {
+    final characteristic = _outboxCharacteristics[peerId];
+
+    if (characteristic == null) {
+      throw StateError('No BLE characteristic for peer $peerId');
+    }
+
+    final mtu = _peerMtu[peerId] ?? 23;
+    final maxGattPayload = (mtu - 3).clamp(20, 244);
+    final fragmentPayloadSize =
+        maxGattPayload - BleFragment.headerSize;
+
+    if (fragmentPayloadSize <= 0) {
+      throw StateError('MTU $mtu is too small for BLE fragmentation');
+    }
+
+    final total = (bytes.length / fragmentPayloadSize).ceil();
+
+    if (total <= 0 || total > 0xFFFF) {
+      throw StateError(
+        'Packet is too large for BLE fragmentation: '
+        '${bytes.length} bytes',
+      );
+    }
+
+    final transferId = _uuidToBytes(const Uuid().v4());
+
+    debugPrint(
+      '[bitmesh] sending ${bytes.length} bytes to $peerId '
+      'as $total BLE fragments '
+      '(MTU=$mtu, fragmentPayload=$fragmentPayloadSize)',
+    );
+
+    for (var index = 0; index < total; index++) {
+      final start = index * fragmentPayloadSize;
+      final end = (start + fragmentPayloadSize).clamp(0, bytes.length);
+
+      final fragment = BleFragment(
+        transferId: transferId,
+        index: index,
+        total: total,
+        data: Uint8List.fromList(bytes.sublist(start, end)),
+      );
+
+      await characteristic.write(
+        fragment.encode(),
+        withoutResponse: false,
+      );
     }
   }
 
-  // ---------------------------------------------------------------------
-  // Sending a chat message
-  // ---------------------------------------------------------------------
+  Uint8List _uuidToBytes(String uuid) {
+    final hex = uuid.replaceAll('-', '');
+    final bytes = Uint8List(16);
+
+    for (var i = 0; i < 16; i++) {
+      bytes[i] = int.parse(
+        hex.substring(i * 2, i * 2 + 2),
+        radix: 16,
+      );
+    }
+
+    return bytes;
+  }
+
+  // -------------------------------------------------------------------------
+  // Sending chat
+  // -------------------------------------------------------------------------
 
   Future<void> sendMessage(String text) async {
     final msgId = const Uuid().v4();
+    final timestampMs = DateTime.now().millisecondsSinceEpoch;
+
     final payload = ChatPayload(
       senderName: selfDisplayName,
       text: text,
-      timestampMs: DateTime.now().millisecondsSinceEpoch,
+      timestampMs: timestampMs,
     );
-    final plaintext = payload.encode();
 
-    _seenMessageIds.add(msgId);
-    _seenMessageOrder.add(msgId);
-    _trimSeenCache();
+    final plaintext = payload.encode();
+    _markSeen(msgId);
 
     final message = ChatMessage(
       id: msgId,
       senderId: selfPeerId,
       senderName: selfDisplayName,
       text: text,
-      timestamp: DateTime.now(),
+      timestamp: DateTime.fromMillisecondsSinceEpoch(timestampMs),
       isMine: true,
     );
+
     _messages.add(message);
     await persistence.saveMessage(message);
     notifyListeners();
 
     await _broadcastPlaintext(
-      type: MeshPacket.typeChat,
+      type: MeshPacketType.message,
       ttl: defaultTtl,
+      timestampMs: timestampMs,
       msgId: msgId,
       senderId: selfPeerId,
       plaintext: plaintext,
     );
   }
 
-  /// Encrypts the given plaintext separately for EACH connected peer (using
-  /// that peer's own session key) and writes it to them individually - this
-  /// is the hop-by-hop model described in encryption_service.dart.
   Future<void> _broadcastPlaintext({
-    required int type,
+    required MeshPacketType type,
     required int ttl,
+    required int timestampMs,
     required String msgId,
     required String senderId,
     required Uint8List plaintext,
     String? excludePeerId,
   }) async {
-    for (final peerId in _connectedDevices.keys) {
+    final peerIds = List<String>.from(_connectedDevices.keys);
+
+    for (final peerId in peerIds) {
       if (peerId == excludePeerId) continue;
-      if (!encryption.hasSession(peerId)) continue; // handshake not done yet
-      final cipherText = await encryption.encryptFor(peerId, plaintext);
-      final packet = MeshPacket(
-        type: type,
-        ttl: ttl,
-        msgId: msgId,
-        senderId: senderId,
-        payload: cipherText,
-      );
-      await _writeRaw(peerId, packet.toBytes());
+      if (!encryption.hasSession(peerId)) continue;
+
+      try {
+        final cipherText = await encryption.encryptFor(
+          peerId,
+          plaintext,
+        );
+
+        final packet = _buildEncryptedPacket(
+          type: type,
+          ttl: ttl,
+          timestampMs: timestampMs,
+          msgId: msgId,
+          senderId: senderId,
+          cipherText: cipherText,
+        );
+
+        await _writeRaw(peerId, MeshPacketCodec.encode(packet));
+      } catch (e) {
+        debugPrint('[bitmesh] send to $peerId failed: $e');
+      }
     }
   }
 
-  // ---------------------------------------------------------------------
-  // Receiving + relay logic
-  // ---------------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // Receiving + relay
+  // -------------------------------------------------------------------------
 
-  Future<void> _handleIncomingBytes(String fromPeerId, Uint8List bytes) async {
-    final packet = MeshPacket.fromBytes(bytes);
-    if (packet == null) return; // malformed / not fully reassembled yet
+  Future<void> _handleIncomingBytes(
+    String fromPeerId,
+    Uint8List bytes,
+  ) async {
+    final completePacket = _reassembler.add(fromPeerId, bytes);
+    if (completePacket == null) return;
 
-    if (packet.type == MeshPacket.typeHandshake) {
-      await encryption.establishSession(fromPeerId, packet.payload);
-      return; // handshake packets are never relayed or de-duped as chat
-    }
+    final packet = MeshPacketCodec.decode(completePacket);
 
-    if (_seenMessageIds.contains(packet.msgId)) return;
-    _seenMessageIds.add(packet.msgId);
-    _seenMessageOrder.add(packet.msgId);
-    _trimSeenCache();
-
-    final plaintext = await encryption.decryptFrom(fromPeerId, packet.payload);
-    if (plaintext == null) return; // no session yet, or tampered - drop
-
-    if (packet.type == MeshPacket.typeChat && packet.senderId != selfPeerId) {
-      final chatPayload = ChatPayload.decode(plaintext);
-      final message = ChatMessage(
-        id: packet.msgId,
-        senderId: packet.senderId,
-        senderName: chatPayload.senderName,
-        text: chatPayload.text,
-        timestamp: DateTime.fromMillisecondsSinceEpoch(chatPayload.timestampMs),
-        isMine: false,
+    if (packet == null) {
+      debugPrint(
+        '[bitmesh] malformed protocol packet from $fromPeerId',
       );
-      _messages.add(message);
-      await persistence.saveMessage(message);
-      notifyListeners();
+      return;
     }
 
-    // Relay onward: re-encrypt with EACH other neighbor's own session key
-    // (the plaintext is what's forwarded logically; each hop gets its own
-    // ciphertext). TTL is decremented once per relay, not once per neighbor.
-    if (packet.ttl > 1) {
+    if (packet.type == MeshPacketType.noiseHandshake) {
+      try {
+        await encryption.establishSession(
+          fromPeerId,
+          packet.payload,
+        );
+      } catch (e) {
+        debugPrint(
+          '[bitmesh] handshake failed with $fromPeerId: $e',
+        );
+      }
+      return;
+    }
+
+    if (packet.type != MeshPacketType.message) {
+      debugPrint(
+        '[bitmesh] received unsupported protocol type '
+        '${packet.type.name} from $fromPeerId',
+      );
+      return;
+    }
+
+    if (!packet.isEncrypted) {
+      debugPrint(
+        '[bitmesh] dropped unencrypted message ${packet.messageId}',
+      );
+      return;
+    }
+
+    // Only mark the message as seen after authentication/decryption succeeds.
+    if (_seenMessageIds.contains(packet.messageId)) return;
+
+    final plaintext = await encryption.decryptFrom(
+      fromPeerId,
+      packet.payload,
+    );
+
+    if (plaintext == null) {
+      debugPrint(
+        '[bitmesh] dropped undecryptable packet '
+        '${packet.messageId} from $fromPeerId',
+      );
+      return;
+    }
+
+    _markSeen(packet.messageId);
+
+    if (packet.senderId != selfPeerId) {
+      try {
+        final chatPayload = ChatPayload.decode(plaintext);
+
+        final message = ChatMessage(
+          id: packet.messageId,
+          senderId: packet.senderId,
+          senderName: chatPayload.senderName,
+          text: chatPayload.text,
+          timestamp: DateTime.fromMillisecondsSinceEpoch(
+            chatPayload.timestampMs,
+          ),
+          isMine: false,
+        );
+
+        _messages.add(message);
+        await persistence.saveMessage(message);
+        notifyListeners();
+      } catch (e) {
+        debugPrint(
+          '[bitmesh] invalid chat payload '
+          '${packet.messageId}: $e',
+        );
+        return;
+      }
+    }
+
+    if (packet.ttl > 1 && packet.relayAllowed) {
+      final relayedPacket = packet.decrementedForRelay();
+      if (relayedPacket == null) return;
+
+      final relayPlaintext = plaintext;
+
       await _broadcastPlaintext(
-        type: packet.type,
-        ttl: packet.ttl - 1,
-        msgId: packet.msgId,
-        senderId: packet.senderId,
-        plaintext: plaintext,
+        type: relayedPacket.type,
+        ttl: relayedPacket.ttl,
+        timestampMs: relayedPacket.timestampMs,
+        msgId: relayedPacket.messageId,
+        senderId: relayedPacket.senderId,
+        plaintext: relayPlaintext,
         excludePeerId: fromPeerId,
       );
     }
+  }
+
+  void _markSeen(String msgId) {
+    if (_seenMessageIds.contains(msgId)) return;
+
+    _seenMessageIds.add(msgId);
+    _seenMessageOrder.add(msgId);
+    _trimSeenCache();
   }
 
   void _trimSeenCache() {
