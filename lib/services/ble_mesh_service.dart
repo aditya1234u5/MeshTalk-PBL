@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
-import 'package:flutter_ble_peripheral/flutter_ble_peripheral.dart';
+import 'native_gatt_bridge.dart';
 import 'package:uuid/uuid.dart';
 
 import '../models/message.dart';
@@ -81,7 +81,7 @@ class BleMeshService extends ChangeNotifier {
     _isRunning = false;
     await _scanSub?.cancel();
     await FlutterBluePlus.stopScan();
-    await FlutterBlePeripheral().stop();
+    await _nativeGatt.stop();
     for (final device in _connectedDevices.values) {
       await device.disconnect();
     }
@@ -93,49 +93,35 @@ class BleMeshService extends ChangeNotifier {
   // Peripheral role: advertise + accept incoming writes
   // ---------------------------------------------------------------------
 
-  final _peripheral = FlutterBlePeripheral();
-  StreamSubscription<Uint8List>? _peripheralDataSub;
+  final _nativeGatt = NativeGattBridge();
+  StreamSubscription<GattWrite>? _peripheralDataSub;
 
   Future<void> _startPeripheral() async {
-    // Deliberately no localName: identity now comes from device.remoteId
-    // at scan time (see _startCentralScan), not from the advertised name,
-    // which proved unreliable to read back on real hardware even when
-    // confirmed present on the advertising side. This also matches real
-    // bitchat's approach (setIncludeDeviceName(false)) - service UUID
-    // alone in the primary advertisement, nothing else needed.
-    final advertiseData = AdvertiseDataCore(
-      serviceUuid: MeshUuids.serviceUuid,
-    );
-    debugPrint('[bitmesh] starting peripheral, service=${MeshUuids.serviceUuid}');
-    // GattServerSettings() with no args defaults to the Nordic UART TX/RX
-    // pair, NOT our own inboxCharacteristicUuid - centrals discovering us
-    // would never find a characteristic matching MeshUuids.inboxCharacteristicUuid
-    // and every connection attempt would silently fail. Serve exactly the
-    // one write characteristic our central-side code actually looks for.
+    // Peripheral role now runs on a small custom native Android bridge
+    // (android/app/.../MainActivity.kt) instead of flutter_ble_peripheral.
+    // That plugin's onDataReceived only ever gave raw bytes with no way
+    // to tell which connected central just wrote - confirmed as the
+    // actual cause of messages being attributed to the wrong peer during
+    // 2-phone testing (a "most recently connected" heuristic was tried
+    // first and wasn't reliable once 2+ peers were connected at once).
+    // Android's own GATT callback gives the writing device directly, so
+    // the native bridge captures and forwards that real identity.
+    debugPrint('[bitmesh] starting native peripheral, service=${MeshUuids.serviceUuid}');
     try {
-      await _peripheral.start(
-        advertiseData: advertiseData,
-        gattServer: GattServerSettings(
-          characteristics: [
-            GattCharacteristic.write(MeshUuids.inboxCharacteristicUuid),
-          ],
-        ),
-      );
-      debugPrint('[bitmesh] peripheral.start() completed without throwing');
+      await _nativeGatt.start();
+      debugPrint('[bitmesh] native peripheral started');
     } catch (e, st) {
-      debugPrint('[bitmesh] peripheral.start() THREW: $e');
+      debugPrint('[bitmesh] native peripheral start THREW: $e');
       debugPrint('$st');
     }
-    _peripheralDataSub = _peripheral.onDataReceived.listen((bytes) {
-      debugPrint('[bitmesh] onDataReceived: ${bytes.length} bytes');
-      onPeripheralDataReceived('unknown', bytes);
+    _peripheralDataSub = _nativeGatt.onWrite.listen((write) {
+      debugPrint('[bitmesh] write from ${write.address}: ${write.bytes.length} bytes');
+      onPeripheralDataReceived(write.address, write.bytes);
     });
   }
 
-  /// Called by the peripheral GATT server callback when a central peer
-  /// writes bytes to our inbox characteristic. `fromPeerId` should be
-  /// derived from the connecting central's identity by whatever the
-  /// plugin's callback exposes (see README).
+  /// Called with the REAL identity of whoever wrote these bytes to us,
+  /// straight from the native GATT callback - no more guessing.
   void onPeripheralDataReceived(String fromPeerId, Uint8List bytes) {
     _handleIncomingBytes(fromPeerId, bytes);
   }
