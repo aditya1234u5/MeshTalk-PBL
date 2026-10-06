@@ -527,10 +527,33 @@ class BleMeshService extends ChangeNotifier {
     String fromPeerId,
     Uint8List bytes,
   ) async {
+    debugPrint(
+      '[bitmesh] incoming BLE fragment from $fromPeerId: '
+      '${bytes.length} bytes',
+    );
+
     final completePacket = _reassembler.add(fromPeerId, bytes);
-    if (completePacket == null) return;
+
+    if (completePacket == null) {
+      debugPrint(
+        '[bitmesh] fragment stored; waiting for more fragments '
+        'from $fromPeerId',
+      );
+      return;
+    }
+
+    debugPrint(
+      '[bitmesh] complete packet reassembled from $fromPeerId: '
+      '${completePacket.length} bytes',
+    );
 
     final packet = MeshPacketCodec.decode(completePacket);
+
+    debugPrint(
+      '[bitmesh] protocol decode result: '
+      '${packet == null ? 'FAILED' : 'OK type=${packet.type.name} '
+          'ttl=${packet.ttl} encrypted=${packet.isEncrypted}'}',
+    );
 
     if (packet == null) {
       debugPrint(
@@ -540,18 +563,45 @@ class BleMeshService extends ChangeNotifier {
     }
 
     if (packet.type == MeshPacketType.noiseHandshake) {
-      try {
-        await encryption.establishSession(
-          fromPeerId,
-          packet.payload,
-        );
-      } catch (e) {
-        debugPrint(
-          '[bitmesh] handshake failed with $fromPeerId: $e',
-        );
-      }
-      return;
+  debugPrint(
+    '[bitmesh] received handshake from $fromPeerId '
+    'payload=${packet.payload.length} bytes '
+    'sender=${packet.senderId}',
+  );
+
+  try {
+    final hadSession = encryption.hasSession(fromPeerId);
+
+    await encryption.establishSession(
+      fromPeerId,
+      packet.payload,
+    );
+
+    debugPrint(
+      '[bitmesh] session established with $fromPeerId '
+      '(wasExisting=$hadSession, '
+      'session=${encryption.hasSession(fromPeerId)})',
+    );
+
+    // Respond only to the first handshake so we don't create
+    // an infinite A -> B -> A -> B handshake loop.
+    if (!hadSession &&
+        _outboxCharacteristics.containsKey(fromPeerId)) {
+      await _sendHandshake(fromPeerId);
+
+      debugPrint(
+        '[bitmesh] handshake response sent to $fromPeerId',
+      );
     }
+  } catch (e, st) {
+    debugPrint(
+      '[bitmesh] handshake failed with $fromPeerId: $e',
+    );
+    debugPrint('$st');
+  }
+
+  return;
+}
 
     if (packet.type != MeshPacketType.message) {
       debugPrint(
@@ -570,6 +620,11 @@ class BleMeshService extends ChangeNotifier {
 
     // Only mark the message as seen after authentication/decryption succeeds.
     if (_seenMessageIds.contains(packet.messageId)) return;
+
+    debugPrint(
+      '[bitmesh] attempting decrypt from $fromPeerId '
+      '(session=${encryption.hasSession(fromPeerId)})',
+    );
 
     final plaintext = await encryption.decryptFrom(
       fromPeerId,
