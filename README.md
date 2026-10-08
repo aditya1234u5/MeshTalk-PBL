@@ -1,16 +1,12 @@
-﻿<img width="256" height="256" alt="icon_128x128@2x" src="https://github.com/user-attachments/assets/90133f83-b4f6-41c6-aab9-25d0859d2a47" />
+<p align="center">
+  <img src="docs/meshtalk-logo.png" alt="MeshTalk logo" width="256" height="256" />
+</p>
 
 ## MeshTalk for Android
 
 A decentralized peer-to-peer messaging app with dual transport architecture: local Bluetooth mesh networks for offline communication and internet-based Nostr protocol for global reach. No accounts, no phone numbers, no central servers.
 
-This is the Android implementation of bitchat, fully protocol-compatible with the [iOS version](https://github.com/permissionlesstech/bitchat) for cross-platform mesh communication.
-
-[meshtalk.app](http://meshtalk.app)
-
-[GitHub Releases](https://github.com/permissionlesstech/meshtalk-android/releases)
-
-[<img alt="Get it on Google Play" height="60" src="https://play.google.com/intl/en_us/badges/static/images/badges/en_badge_web_generic.png"/>](https://play.google.com/store/apps/details?id=com.meshtalk.android)
+MeshTalk is built on [bitchat-android](https://github.com/permissionlesstech/bitchat-android) and stays protocol-compatible with the [bitchat iOS version](https://github.com/permissionlesstech/bitchat) for cross-platform mesh communication.
 
 ## See it in action
 
@@ -20,14 +16,10 @@ This is the Android implementation of bitchat, fully protocol-compatible with th
     <th>Geohash globe picker</th>
   </tr>
   <tr>
-    <td><img src="docs/screenshots/readme-mesh-chat.png" alt="Active four-peer Bitchat mesh conversation with an image, voice messages, and text messages" width="360"/></td>
-    <td><img src="docs/screenshots/readme-geohash-globe.png" alt="Bitchat geohash location picker showing the whole Earth and geohash grid" width="360"/></td>
+    <td><img src="docs/screenshots/readme-mesh-chat.png" alt="Active four-peer MeshTalk mesh conversation with an image, voice messages, and text messages" width="360"/></td>
+    <td><img src="docs/screenshots/readme-geohash-globe.png" alt="MeshTalk geohash location picker showing the whole Earth and geohash grid" width="360"/></td>
   </tr>
 </table>
-
-## License
-
-This project is released into the public domain. See the [LICENSE](LICENSE.md) file for details.
 
 ## Features
 
@@ -70,8 +62,8 @@ This project is released into the public domain. See the [LICENSE](LICENSE.md) f
 Requires Android Studio and the Android SDK (API 26+).
 
 ```bash
-git clone https://github.com/permissionlesstech/meshtalk-android.git
-cd meshtalk-android
+git clone https://github.com/aditya1234u5/MeshTalk-PBL.git
+cd MeshTalk-PBL
 ./gradlew assembleDebug
 ```
 
@@ -82,12 +74,6 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
 The app requests Bluetooth, location (required for BLE scanning), and notification permissions at runtime.
-
-Release APKs and the Android App Bundle can be rebuilt byte-for-byte in the
-pinned Linux container. Maintainers should follow the
-[Android release guide](docs/maintainer-release-guide.md). See
-[Reproducible builds](docs/reproducible-builds.md) for the build trust model
-and public GitHub/Google Play verification procedures.
 
 ## Testing
 
@@ -103,3 +89,11 @@ and public GitHub/Google Play verification procedures.
 ```
 
 Note that BLE mesh behavior is difficult to emulate; protocol and session logic is covered by unit tests, while radio-level behavior needs real devices.
+
+## Credits
+
+MeshTalk is based on the open-source [bitchat-android](https://github.com/permissionlesstech/bitchat-android) project.
+
+## License
+
+See the [LICENSE](LICENSE.md) file for details.
