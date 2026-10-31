@@ -109,3 +109,37 @@ fun ChatSearchBar(
         )
     }
 }
+
+/**
+ * Slim row with a search icon, shown above the chat box in chats that have no other status strip
+ * (for example private chats). Tapping it should open [ChatSearchBar].
+ */
+@Composable
+fun ChatSearchLauncher(
+    onClick: () -> Unit,
+    colorScheme: ColorScheme,
+    modifier: Modifier = Modifier
+) {
+    val muted = colorScheme.onSurfaceVariant
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = "Search this chat",
+            fontSize = 11.sp,
+            color = muted,
+            modifier = Modifier.weight(1f)
+        )
+        IconButton(onClick = onClick, modifier = Modifier.size(28.dp)) {
+            Icon(
+                imageVector = Icons.Default.Search,
+                contentDescription = "Search messages",
+                tint = muted,
+                modifier = Modifier.size(18.dp)
+            )
+        }
+    }
+}
