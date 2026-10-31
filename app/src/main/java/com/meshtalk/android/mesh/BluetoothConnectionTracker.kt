@@ -158,6 +158,18 @@ class BluetoothConnectionTracker(
     fun updateScanRSSI(deviceAddress: String, rssi: Int) {
         scanRSSI[deviceAddress] = rssi
     }
+
+    /**
+     * Store a fresh live RSSI reading for a connected device. Readings are lightly smoothed
+     * (60% old, 40% new) because single Bluetooth RSSI values jump around a lot.
+     */
+    fun updateConnectionRSSI(deviceAddress: String, rssi: Int) {
+        connectedDevices.computeIfPresent(deviceAddress) { _, conn ->
+            val smoothed = if (conn.rssi == Int.MIN_VALUE) rssi else (conn.rssi * 6 + rssi * 4) / 10
+            conn.copy(rssi = smoothed)
+        }
+        scanRSSI[deviceAddress] = rssi
+    }
     
     /**
      * Get best available RSSI for a device (connection RSSI preferred, then scan RSSI)

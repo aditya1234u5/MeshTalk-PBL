@@ -37,6 +37,7 @@ class BluetoothGattClientManager(
         private const val SCAN_MAX_RETRY_DELAY_MS = 30_000L    // cap on backoff delay
         private const val SCAN_WATCHDOG_INTERVAL_MS = 30_000L  // how often to verify the scanner is alive
         private const val SCAN_STALE_RESULT_MS = 120_000L      // force a scan restart if no results for this long
+        private const val RSSI_POLL_INTERVAL_MS = 3_000L       // how often to read live signal strength of connected phones
     }
     
     // Core Bluetooth components
@@ -97,6 +98,7 @@ class BluetoothGattClientManager(
     
     // State management
     private var isActive = false
+    private var rssiPollJob: Job? = null
     
     /**
      * Start client manager
@@ -127,6 +129,7 @@ class BluetoothGattClientManager(
         }
         
         isActive = true
+        startRssiPolling()
         
         connectionScope.launch {
             applyPowerProfile(powerManager.profile.value)
@@ -142,6 +145,8 @@ class BluetoothGattClientManager(
         scanningDesired = false
         scanDutyCycleJob?.cancel()
         scanDutyCycleJob = null
+        rssiPollJob?.cancel()
+        rssiPollJob = null
         stopScanWatchdog()
         if (!isActive) {
             // Idempotent stop
@@ -165,6 +170,29 @@ class BluetoothGattClientManager(
         }
     }
     
+    /**
+     * Periodically read the live signal strength (RSSI) of every phone we connected to as a client.
+     * The app uses it to show an estimated distance. (Android only allows this on links where we
+     * are the GATT client; for links where we are the server the last known value is kept.)
+     */
+    private fun startRssiPolling() {
+        rssiPollJob?.cancel()
+        rssiPollJob = connectionScope.launch {
+            while (this@BluetoothGattClientManager.isActive) {
+                delay(RSSI_POLL_INTERVAL_MS)
+                try {
+                    connectionTracker.getConnectedDevices().values
+                        .filter { it.isClient && it.gatt != null }
+                        .forEach { dc ->
+                            try {
+                                dc.gatt?.readRemoteRssi()
+                            } catch (_: Exception) { }
+                        }
+                } catch (_: Exception) { }
+            }
+        }
+    }
+
     /**
      * Handle scan state changes from power manager
      */
@@ -520,6 +548,16 @@ class BluetoothGattClientManager(
                 }
             }
             
+            override fun onReadRemoteRssi(gatt: BluetoothGatt, rssi: Int, status: Int) {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    val address = gatt.device.address
+                    connectionTracker.updateConnectionRSSI(address, rssi)
+                    connectionTracker.getBestRSSI(address)?.let { smoothed ->
+                        delegate?.onRSSIUpdated(address, smoothed)
+                    }
+                }
+            }
+
             override fun onPhyUpdate(gatt: BluetoothGatt, txPhy: Int, rxPhy: Int, status: Int) {
                 Log.i(
                     TAG,

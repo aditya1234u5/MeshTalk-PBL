@@ -443,7 +443,8 @@ fun ChatScreen(viewModel: ChatViewModel) {
                 currentChannel = currentChannel,
                 nickname = nickname,
                 colorScheme = colorScheme,
-                showMediaButtons = showMediaButtons
+                showMediaButtons = showMediaButtons,
+                topContent = { LinkStatusStrip(viewModel = viewModel, colorScheme = colorScheme) }
             )
           }
         }
@@ -645,6 +646,7 @@ fun ChatInputSection(
     colorScheme: ColorScheme,
     showMediaButtons: Boolean,
     recorderFactory: ((String?, String?) -> com.meshtalk.android.features.voice.VoiceRecorder)? = null,
+    topContent: (@Composable () -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -715,6 +717,8 @@ fun ChatInputSection(
                 HorizontalDivider(thickness = 1.dp, color = colorScheme.outlineVariant)
             }
         }
+        // Optional status strip (long-range support + distance to connected phones)
+        topContent?.invoke()
         MessageInput(
             value = messageText,
             onValueChange = onMessageTextChange,
