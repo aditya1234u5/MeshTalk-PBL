@@ -10,7 +10,11 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.ColorScheme
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -43,7 +47,8 @@ import kotlinx.coroutines.delay
 fun LinkStatusStrip(
     viewModel: ChatViewModel,
     colorScheme: ColorScheme,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    onSearchClick: (() -> Unit)? = null
 ) {
     val context = LocalContext.current
 
@@ -87,7 +92,10 @@ fun LinkStatusStrip(
             .fillMaxWidth()
             .padding(horizontal = 12.dp, vertical = 4.dp)
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
             Box(
                 modifier = Modifier
                     .size(8.dp)
@@ -100,8 +108,19 @@ fun LinkStatusStrip(
                 fontSize = 11.sp,
                 color = muted,
                 maxLines = 1,
-                overflow = TextOverflow.Ellipsis
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
             )
+            if (onSearchClick != null) {
+                IconButton(onClick = onSearchClick, modifier = Modifier.size(28.dp)) {
+                    Icon(
+                        imageVector = Icons.Default.Search,
+                        contentDescription = "Search messages",
+                        tint = muted,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
         }
         Text(
             text = peersText,

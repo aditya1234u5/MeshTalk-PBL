@@ -196,7 +196,7 @@ fun ChatScreen(viewModel: ChatViewModel) {
 
     // Determine what messages to show based on current context (unified timelines)
     // Legacy private chat timeline removed - private chats now exclusively use PrivateChatSheet
-    val displayMessages = when {
+    val timelineMessages = when {
         currentChannel != null -> channelMessages[currentChannel] ?: emptyList()
         else -> {
             val locationChannel = selectedLocationChannel
@@ -209,7 +209,22 @@ fun ChatScreen(viewModel: ChatViewModel) {
         }
     }
 
-    // Identity of the timeline on screen, derived exactly like displayMessages above. Drives the
+    // Chat search: while open and non-empty, only messages whose text or sender contains the query are shown
+    var searchActive by remember { mutableStateOf(false) }
+    var searchQuery by remember { mutableStateOf("") }
+    val displayMessages = remember(timelineMessages, searchActive, searchQuery) {
+        val needle = searchQuery.trim()
+        if (searchActive && needle.isNotEmpty()) {
+            timelineMessages.filter {
+                it.content.contains(needle, ignoreCase = true) ||
+                    it.sender.contains(needle, ignoreCase = true)
+            }
+        } else {
+            timelineMessages
+        }
+    }
+
+    // Identity of the timeline on screen, derived exactly like timelineMessages above. Drives the
     // per-conversation scroll position and animation state in MessagesList.
     val conversationKey = when {
         currentChannel != null -> "channel:$currentChannel"
@@ -221,6 +236,12 @@ fun ChatScreen(viewModel: ChatViewModel) {
                 "mesh"
             }
         }
+    }
+
+    // Close the search when the user switches to another chat
+    LaunchedEffect(conversationKey) {
+        searchActive = false
+        searchQuery = ""
     }
 
     val mentionPeerIdentities = remember(
@@ -444,7 +465,26 @@ fun ChatScreen(viewModel: ChatViewModel) {
                 nickname = nickname,
                 colorScheme = colorScheme,
                 showMediaButtons = showMediaButtons,
-                topContent = { LinkStatusStrip(viewModel = viewModel, colorScheme = colorScheme) }
+                topContent = {
+                    if (searchActive) {
+                        ChatSearchBar(
+                            query = searchQuery,
+                            onQueryChange = { searchQuery = it },
+                            matchCount = displayMessages.size,
+                            colorScheme = colorScheme,
+                            onClose = {
+                                searchActive = false
+                                searchQuery = ""
+                            }
+                        )
+                    } else {
+                        LinkStatusStrip(
+                            viewModel = viewModel,
+                            colorScheme = colorScheme,
+                            onSearchClick = { searchActive = true }
+                        )
+                    }
+                }
             )
           }
         }
