@@ -99,6 +99,7 @@ class BluetoothGattClientManager(
     // State management
     private var isActive = false
     private var rssiPollJob: Job? = null
+    private val codedSeenLog = java.util.concurrent.ConcurrentHashMap<String, Long>()
     
     /**
      * Start client manager
@@ -447,7 +448,16 @@ class BluetoothGattClientManager(
         // only used for peers too weak for a normal link; stronger peers connect via their normal advert.
         val legacyThreshold = powerManager.getRSSIThreshold()
         val isCoded = LongRangeBle.isCodedResult(result)
-        if (isCoded && rssi >= legacyThreshold) {
+        if (isCoded) {
+            // Log each phone's coded advert at most every 10 s, so long-range discovery can be checked in Logcat
+            val now = System.currentTimeMillis()
+            val lastLogged = codedSeenLog[deviceAddress] ?: 0L
+            if (now - lastLogged > 10_000L) {
+                codedSeenLog[deviceAddress] = now
+                Log.i(TAG, "Coded PHY advert from $deviceAddress rssi=$rssi dBm")
+            }
+        }
+        if (isCoded && rssi >= LongRangeBle.CODED_SKIP_ABOVE_DBM) {
             return
         }
         val rssiLimit = if (isCoded) LongRangeBle.CODED_MIN_RSSI_DBM else legacyThreshold
@@ -501,7 +511,7 @@ class BluetoothGattClientManager(
 
         val deviceAddress = device.address
         val linkID = UUID.randomUUID().toString()
-        Log.d(TAG, "Connecting to bitchat device: $deviceAddress (peerID: $peerID)")
+        Log.i(TAG, "Connecting to bitchat device: $deviceAddress (peerID: $peerID, codedPhy=$useCodedPhy)")
 
         val gattCallback = object : BluetoothGattCallback() {
             override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {

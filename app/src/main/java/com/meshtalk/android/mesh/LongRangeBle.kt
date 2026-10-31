@@ -25,6 +25,12 @@ object LongRangeBle {
     /** Weakest Coded PHY advert (dBm) we will still try to connect to. */
     const val CODED_MIN_RSSI_DBM = -105
 
+    /**
+     * Coded PHY adverts stronger than this (dBm) are ignored, because the phone is close enough
+     * for a normal fast link. Weaker ones may be connected over the Coded PHY.
+     */
+    const val CODED_SKIP_ABOVE_DBM = -70
+
     /** True when long range is switched on AND this phone supports Coded PHY + extended advertising. */
     fun isSupported(adapter: BluetoothAdapter?): Boolean {
         if (!ENABLED || adapter == null) return false
