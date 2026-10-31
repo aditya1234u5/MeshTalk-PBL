@@ -15,5 +15,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "meshtalk-android"
 include(":app")
-include(":wear")
+//include(":wear")
 // Using published Arti AAR; local module not included
