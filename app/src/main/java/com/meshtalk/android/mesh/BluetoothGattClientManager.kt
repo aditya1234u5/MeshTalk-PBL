@@ -265,7 +265,8 @@ class BluetoothGattClientManager(
             lastScanStartTime = currentTime
             isCurrentlyScanning = true
             
-            bleScanner.startScan(scanFilters, powerManager.getScanSettings(), scanCallback)
+            val longRange = LongRangeBle.isSupported(bluetoothAdapter)
+            bleScanner.startScan(scanFilters, powerManager.getScanSettings(longRange), scanCallback)
             Log.i(TAG, "BLE scan started")
         } catch (e: Exception) {
             Log.e(TAG, "Exception starting scan: ${e.message}")
@@ -413,8 +414,16 @@ class BluetoothGattClientManager(
             )
         } catch (_: Exception) { }
         
-        // Power-aware RSSI filtering
-        if (rssi < powerManager.getRSSIThreshold()) {
+        // Power-aware RSSI filtering.
+        // Normal adverts must be strong enough for a normal link. Coded PHY (long range) adverts are
+        // only used for peers too weak for a normal link; stronger peers connect via their normal advert.
+        val legacyThreshold = powerManager.getRSSIThreshold()
+        val isCoded = LongRangeBle.isCodedResult(result)
+        if (isCoded && rssi >= legacyThreshold) {
+            return
+        }
+        val rssiLimit = if (isCoded) LongRangeBle.CODED_MIN_RSSI_DBM else legacyThreshold
+        if (rssi < rssiLimit) {
             // Even if we skip connecting, still publish scan result to debug UI
             try {
                 DebugSettingsManager.getInstance().addScanResult(
@@ -450,7 +459,7 @@ class BluetoothGattClientManager(
         
         // Add pending connection and start connection
         if (connectionTracker.addPendingConnection(deviceAddress)) {
-            connectToDevice(device, rssi, peerID)
+            connectToDevice(device, rssi, peerID, isCoded)
         }
     }
     
@@ -458,7 +467,7 @@ class BluetoothGattClientManager(
      * Connect to a device as GATT client
      */
     @Suppress("DEPRECATION")
-    private fun connectToDevice(device: BluetoothDevice, rssi: Int, peerID: String? = null) {
+    private fun connectToDevice(device: BluetoothDevice, rssi: Int, peerID: String? = null, useCodedPhy: Boolean = false) {
         if (!isClientRoleEnabled()) return
         if (!permissionManager.hasBluetoothPermissions()) return
 
@@ -469,6 +478,19 @@ class BluetoothGattClientManager(
         val gattCallback = object : BluetoothGattCallback() {
             override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
                 if (newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
+                    if (useCodedPhy) {
+                        // Keep this long-range link on the Coded PHY
+                        try {
+                            gatt.setPreferredPhy(
+                                BluetoothDevice.PHY_LE_CODED_MASK,
+                                BluetoothDevice.PHY_LE_CODED_MASK,
+                                LongRangeBle.CODED_PHY_OPTION
+                            )
+                            Log.i(TAG, "Requested Coded PHY link for $deviceAddress")
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Could not request Coded PHY for $deviceAddress: ${e.message}")
+                        }
+                    }
                     // Request a larger MTU. Must be done before any data transfer.
                     connectionScope.launch {
                         delay(200) // A small delay can improve reliability of MTU request.
@@ -498,6 +520,13 @@ class BluetoothGattClientManager(
                 }
             }
             
+            override fun onPhyUpdate(gatt: BluetoothGatt, txPhy: Int, rxPhy: Int, status: Int) {
+                Log.i(
+                    TAG,
+                    "PHY for ${gatt.device.address}: tx=${LongRangeBle.phyName(txPhy)} rx=${LongRangeBle.phyName(rxPhy)} (status=$status)"
+                )
+            }
+
             override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
                 val deviceAddress = gatt.device.address
 
@@ -589,7 +618,14 @@ class BluetoothGattClientManager(
         }
         
         try {
-            val gatt = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+            val gatt = if (useCodedPhy) {
+                // Connect on the Coded PHY so the link keeps its long range
+                device.connectGatt(
+                    context, false, gattCallback, BluetoothDevice.TRANSPORT_LE, BluetoothDevice.PHY_LE_CODED_MASK
+                )
+            } else {
+                device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+            }
             if (gatt == null) {
                 Log.e(TAG, "connectGatt returned null for $deviceAddress")
                 // keep the pending connection so we can avoid too many reconnections attempts, TODO: needs testing
