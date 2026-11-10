@@ -4,6 +4,9 @@ import android.bluetooth.*
 import android.bluetooth.le.AdvertiseCallback
 import android.bluetooth.le.AdvertiseData
 import android.bluetooth.le.AdvertiseSettings
+import android.bluetooth.le.AdvertisingSet
+import android.bluetooth.le.AdvertisingSetCallback
+import android.bluetooth.le.AdvertisingSetParameters
 import android.bluetooth.le.BluetoothLeAdvertiser
 import android.content.Context
 import android.os.ParcelUuid
@@ -47,6 +50,7 @@ class BluetoothGattServerManager(
     private val serverLinkIDs = ConcurrentHashMap<String, String>()
     private var characteristic: BluetoothGattCharacteristic? = null
     private var advertiseCallback: AdvertiseCallback? = null
+    private var longRangeCallback: AdvertisingSetCallback? = null
     private var advertiseRetryCount = 0
     
     // State management
@@ -438,6 +442,7 @@ class BluetoothGattServerManager(
         
         try {
             bleAdvertiser.startAdvertising(settings, data, scanResponse, advertiseCallback)
+            startLongRangeAdvertising()
         } catch (se: SecurityException) {
             Log.e(TAG, "SecurityException starting advertising (missing permission?): ${se.message}")
         } catch (e: Exception) {
@@ -455,6 +460,83 @@ class BluetoothGattServerManager(
             advertiseCallback?.let { cb -> bleAdvertiser.stopAdvertising(cb) }
         } catch (e: Exception) {
             Log.w(TAG, "Error stopping advertising: ${e.message}")
+        }
+        stopLongRangeAdvertising()
+    }
+
+    /**
+     * Start a second advertising set on the Bluetooth 5 Coded PHY so far-away phones can find us.
+     * Normal advertising keeps running for nearby and older phones. Does nothing on phones without
+     * Coded PHY + extended advertising support.
+     */
+    private fun startLongRangeAdvertising() {
+        if (!LongRangeBle.isSupported(bluetoothAdapter)) return
+        if (!permissionManager.hasBluetoothPermissions() || !isActive || !isServerRoleEnabled()) return
+        val advertiser = bleAdvertiser ?: return
+        if (longRangeCallback != null) return // already running
+
+        // Extended connectable adverts cannot have a scan response, so the stable identity
+        // (first 8 bytes of peerID) goes straight into the advert data.
+        val peerIDBytes = try {
+            myPeerID.chunked(2).map { it.toInt(16).toByte() }.toByteArray().take(8).toByteArray()
+        } catch (e: Exception) {
+            ByteArray(0)
+        }
+
+        val params = AdvertisingSetParameters.Builder()
+            .setLegacyMode(false)
+            .setConnectable(true)
+            .setScannable(false)
+            .setPrimaryPhy(BluetoothDevice.PHY_LE_CODED)
+            .setSecondaryPhy(BluetoothDevice.PHY_LE_CODED)
+            .setInterval(AdvertisingSetParameters.INTERVAL_LOW)
+            .setTxPowerLevel(AdvertisingSetParameters.TX_POWER_HIGH)
+            .build()
+
+        val data = AdvertiseData.Builder()
+            .addServiceUuid(ParcelUuid(AppConstants.Mesh.Gatt.SERVICE_UUID))
+            .addServiceData(ParcelUuid(AppConstants.Mesh.Gatt.SERVICE_UUID), peerIDBytes)
+            .setIncludeTxPowerLevel(false)
+            .setIncludeDeviceName(false)
+            .build()
+
+        val callback = object : AdvertisingSetCallback() {
+            override fun onAdvertisingSetStarted(advertisingSet: AdvertisingSet?, txPower: Int, status: Int) {
+                if (status == AdvertisingSetCallback.ADVERTISE_SUCCESS) {
+                    Log.i(TAG, "Long-range (Coded PHY) advertising started, txPower=$txPower")
+                } else {
+                    Log.w(TAG, "Long-range (Coded PHY) advertising failed: status=$status")
+                    longRangeCallback = null
+                }
+            }
+
+            override fun onAdvertisingSetStopped(advertisingSet: AdvertisingSet?) {
+                Log.i(TAG, "Long-range (Coded PHY) advertising stopped")
+            }
+        }
+
+        try {
+            longRangeCallback = callback
+            advertiser.startAdvertisingSet(params, data, null, null, null, callback)
+        } catch (se: SecurityException) {
+            Log.e(TAG, "SecurityException starting long-range advertising: ${se.message}")
+            longRangeCallback = null
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception starting long-range advertising: ${e.message}")
+            longRangeCallback = null
+        }
+    }
+
+    /**
+     * Stop the Coded PHY advertising set (if running)
+     */
+    private fun stopLongRangeAdvertising() {
+        val callback = longRangeCallback ?: return
+        longRangeCallback = null
+        try {
+            bleAdvertiser?.stopAdvertisingSet(callback)
+        } catch (e: Exception) {
+            Log.w(TAG, "Error stopping long-range advertising: ${e.message}")
         }
     }
     

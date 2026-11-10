@@ -1739,6 +1739,21 @@ fun PrivateChatSheet(
 
     val conversationID = contactResolution.conversationID
     val messages = privateChats[conversationID] ?: privateChats[peerID] ?: emptyList()
+
+    // Chat search: while open and non-empty, only messages whose text or sender contains the query are shown
+    var searchActive by remember(peerID) { mutableStateOf(false) }
+    var searchQuery by remember(peerID) { mutableStateOf("") }
+    val shownMessages = remember(messages, searchActive, searchQuery) {
+        val needle = searchQuery.trim()
+        if (searchActive && needle.isNotEmpty()) {
+            messages.filter {
+                it.content.contains(needle, ignoreCase = true) ||
+                    it.sender.contains(needle, ignoreCase = true)
+            }
+        } else {
+            messages
+        }
+    }
     val sessionState = resolveConversationSessionState(
         conversationID = peerID,
         activeMeshPeerID = activeMeshPeerID,
@@ -1821,7 +1836,7 @@ fun PrivateChatSheet(
                     var isScrolledUp by remember { mutableStateOf(false) }
 
                     MessagesList(
-                        messages = messages,
+                        messages = shownMessages,
                         currentUserNickname = nickname,
                         meshService = viewModel.meshServiceFacade,
                         modifier = Modifier.weight(1f),
@@ -1885,7 +1900,26 @@ fun PrivateChatSheet(
                         currentChannel = null,
                         nickname = nickname,
                         colorScheme = colorScheme,
-                        showMediaButtons = true
+                        showMediaButtons = true,
+                        topContent = {
+                            if (searchActive) {
+                                ChatSearchBar(
+                                    query = searchQuery,
+                                    onQueryChange = { searchQuery = it },
+                                    matchCount = shownMessages.size,
+                                    colorScheme = colorScheme,
+                                    onClose = {
+                                        searchActive = false
+                                        searchQuery = ""
+                                    }
+                                )
+                            } else {
+                                ChatSearchLauncher(
+                                    onClick = { searchActive = true },
+                                    colorScheme = colorScheme
+                                )
+                            }
+                        }
                     )
                 }
 

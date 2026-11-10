@@ -184,7 +184,7 @@ class PowerManager private constructor(context: Context) : LifecycleEventObserve
         }
     }
 
-    fun getScanSettings(): ScanSettings {
+    fun getScanSettings(longRange: Boolean = false): ScanSettings {
         val current = profile.value
         val builder = ScanSettings.Builder()
             .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
@@ -203,6 +203,10 @@ class PowerManager private constructor(context: Context) : LifecycleEventObserve
                 .setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
                 .setMatchMode(ScanSettings.MATCH_MODE_STICKY)
                 .setNumOfMatches(ScanSettings.MATCH_NUM_ONE_ADVERTISEMENT)
+        }
+        if (longRange) {
+            // Also report Bluetooth 5 extended adverts, needed to hear Coded PHY (long range) adverts
+            builder.setLegacy(false).setPhy(ScanSettings.PHY_LE_ALL_SUPPORTED)
         }
         return builder.setReportDelay(0).build()
     }

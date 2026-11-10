@@ -82,6 +82,10 @@ class MainActivity : OrientationAwareActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // TEMP: BLE Coded PHY support check (remove after testing)
+        val phy = com.meshtalk.android.util.BlePhyCapabilities.check(this)
+        android.util.Log.i("PhyCheck", phy.summary())
+        android.widget.Toast.makeText(this, phy.summary(), android.widget.Toast.LENGTH_LONG).show()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             this.setRecentsScreenshotEnabled(false)
         }
